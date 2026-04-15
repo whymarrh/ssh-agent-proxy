@@ -31,8 +31,8 @@ struct Config {
 
 #[derive(serde::Deserialize, Clone)]
 struct MatchRule {
-    directory: PathBuf,
-    fingerprints: Vec<String>,
+    fingerprint: String,
+    directories: Vec<PathBuf>,
 }
 
 impl Config {
@@ -43,7 +43,19 @@ impl Config {
         config.socket = expand_tilde(&config.socket);
         config.upstream = expand_tilde(&config.upstream);
         for rule in &mut config.rules {
-            rule.directory = expand_tilde(&rule.directory);
+            rule.directories = rule
+                .directories
+                .iter()
+                .map(|d| expand_tilde(d))
+                .collect();
+            let before = rule.directories.len();
+            rule.directories.dedup();
+            if rule.directories.len() < before {
+                eprintln!(
+                    "[warn] duplicate directories in rule for {}, duplicates ignored",
+                    rule.fingerprint
+                );
+            }
         }
         Ok(config)
     }
@@ -153,6 +165,15 @@ fn get_process_cmdline(pid: u32) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_owned())
 }
 
+fn matching_fingerprints(config: &Config, cwd: &Path) -> Vec<String> {
+    config
+        .rules
+        .iter()
+        .filter(|rule| rule.directories.iter().any(|d| cwd.starts_with(d)))
+        .map(|rule| rule.fingerprint.clone())
+        .collect()
+}
+
 async fn proxy_request(
     client: &mut UnixStream,
     upstream: &mut UnixStream,
@@ -255,20 +276,25 @@ async fn handle_connection(mut client: UnixStream, conn_config: Arc<Config>) -> 
         cwd.as_deref().and_then(Path::to_str).unwrap_or("-")
     );
 
-    let matched_rule = cwd.as_ref().and_then(|cwd_path| {
-        conn_config
-            .rules
-            .iter()
-            .enumerate()
-            .find(|(_, rule)| cwd_path.starts_with(&rule.directory))
-    });
+    let matched_fps = cwd
+        .as_ref()
+        .map(|cwd_path| matching_fingerprints(&conn_config, cwd_path));
 
-    match matched_rule {
-        Some((idx, rule)) => eprintln!("  rule:    [{idx}] directory={}", rule.directory.display()),
-        None => eprintln!("  rule:    (none, passthrough)"),
+    let allowed_fps: Option<&[String]> = matched_fps
+        .as_ref()
+        .filter(|fps| !fps.is_empty())
+        .map(Vec::as_slice);
+
+    match &allowed_fps {
+        Some(fps) => {
+            eprintln!("  matched: {} fingerprint(s)", fps.len());
+            for fp in *fps {
+                eprintln!("    {fp}");
+            }
+        }
+        None => eprintln!("  matched: (none, passthrough)"),
     }
 
-    let allowed_fps: Option<&[String]> = matched_rule.map(|(_, rule)| rule.fingerprints.as_slice());
     let mut upstream = UnixStream::connect(&conn_config.upstream).await?;
 
     proxy_request(&mut client, &mut upstream, allowed_fps, pid, &first_request).await?;
@@ -282,9 +308,9 @@ fn log_config(config: &Config) {
     eprintln!("  upstream: {}", config.upstream.display());
     for rule in &config.rules {
         eprintln!(
-            "  {} -> {} key(s)",
-            rule.directory.display(),
-            rule.fingerprints.len()
+            "  {} -> {} dir(s)",
+            rule.fingerprint,
+            rule.directories.len()
         );
     }
 }
@@ -347,5 +373,313 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ssh_agent_lib::ssh_key::public::KeyData;
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new(name: &str) -> Self {
+            let path = PathBuf::from(format!("target/test-{name}-{}", process::id()));
+            drop(fs::remove_dir_all(&path));
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self, name: &str) -> PathBuf {
+            self.0.join(name)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            drop(fs::remove_dir_all(&self.0));
+        }
+    }
+
+    fn make_identity(seed: u8, comment: &str) -> Identity {
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&11u32.to_be_bytes());
+        wire.extend_from_slice(b"ssh-ed25519");
+        wire.extend_from_slice(&32u32.to_be_bytes());
+        wire.extend_from_slice(&[seed; 32]);
+        Identity {
+            pubkey: KeyData::decode(&mut &*wire).unwrap(),
+            comment: comment.into(),
+        }
+    }
+
+    fn fp(id: &Identity) -> String {
+        identity_fingerprint(id).unwrap()
+    }
+
+    fn encode_request(req: &Request) -> Vec<u8> {
+        let mut buf = Vec::new();
+        req.encode(&mut buf).unwrap();
+        buf
+    }
+
+    fn encode_response(resp: &Response) -> Vec<u8> {
+        let mut buf = Vec::new();
+        resp.encode(&mut buf).unwrap();
+        buf
+    }
+
+    async fn fake_upstream(listener: UnixListener, identities: Vec<Identity>) {
+        loop {
+            let Ok((mut conn, _)) = listener.accept().await else {
+                break;
+            };
+            let ids = identities.clone();
+            tokio::spawn(async move {
+                loop {
+                    let Ok(frame) = read_frame(&mut conn).await else {
+                        break;
+                    };
+                    let Ok(req) = Request::decode(&mut &*frame) else {
+                        break;
+                    };
+                    let resp = match req {
+                        Request::RequestIdentities => {
+                            Response::IdentitiesAnswer(ids.clone())
+                        }
+                        _ => Response::Failure,
+                    };
+                    let buf = encode_response(&resp);
+                    if write_frame(&mut conn, &buf).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    }
+
+    async fn start_proxy(listener: UnixListener, config: Config) {
+        let config = Arc::new(config);
+        loop {
+            let Ok((client, _)) = listener.accept().await else {
+                break;
+            };
+            let conn_config = Arc::clone(&config);
+            tokio::spawn(async move {
+                drop(handle_connection(client, conn_config).await);
+            });
+        }
+    }
+
+    async fn send_request(client: &mut UnixStream, req: &Request) -> Response {
+        let buf = encode_request(req);
+        write_frame(client, &buf).await.unwrap();
+        let resp_buf = read_frame(client).await.unwrap();
+        Response::decode(&mut &*resp_buf).unwrap()
+    }
+
+    fn expect_identities(resp: Response) -> Vec<Identity> {
+        match resp {
+            Response::IdentitiesAnswer(ids) => ids,
+            other => panic!("expected IdentitiesAnswer, got {other:?}"),
+        }
+    }
+
+    fn make_config(dir: &TestDir, rules: Vec<MatchRule>) -> Config {
+        Config {
+            socket: dir.path("proxy.sock"),
+            upstream: dir.path("upstream.sock"),
+            rules,
+        }
+    }
+
+    #[tokio::test]
+    async fn passthrough_when_no_rules() {
+        let dir = TestDir::new("passthrough");
+        let key_a = make_identity(1, "key-a");
+        let key_b = make_identity(2, "key-b");
+
+        let upstream_listener = UnixListener::bind(dir.path("upstream.sock")).unwrap();
+        let proxy_listener = UnixListener::bind(dir.path("proxy.sock")).unwrap();
+
+        tokio::spawn(fake_upstream(upstream_listener, vec![key_a, key_b]));
+        tokio::spawn(start_proxy(proxy_listener, make_config(&dir, vec![])));
+
+        let mut client = UnixStream::connect(dir.path("proxy.sock")).await.unwrap();
+        let ids = expect_identities(send_request(&mut client, &Request::RequestIdentities).await);
+        assert_eq!(ids.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn filters_by_fingerprint_when_cwd_matches() {
+        let dir = TestDir::new("filter");
+        let key_a = make_identity(1, "key-a");
+        let key_b = make_identity(2, "key-b");
+        let fp_a = fp(&key_a);
+        let cwd = env::current_dir().unwrap();
+
+        let upstream_listener = UnixListener::bind(dir.path("upstream.sock")).unwrap();
+        let proxy_listener = UnixListener::bind(dir.path("proxy.sock")).unwrap();
+
+        tokio::spawn(fake_upstream(upstream_listener, vec![key_a, key_b]));
+        tokio::spawn(start_proxy(
+            proxy_listener,
+            make_config(&dir, vec![MatchRule {
+                fingerprint: fp_a.clone(),
+                directories: vec![cwd],
+            }]),
+        ));
+
+        let mut client = UnixStream::connect(dir.path("proxy.sock")).await.unwrap();
+        let ids = expect_identities(send_request(&mut client, &Request::RequestIdentities).await);
+        assert_eq!(ids.len(), 1);
+        assert_eq!(identity_fingerprint(&ids[0]).unwrap(), fp_a);
+    }
+
+    #[tokio::test]
+    async fn multiple_rules_match_same_cwd() {
+        let dir = TestDir::new("multimatch");
+        let key_a = make_identity(1, "key-a");
+        let key_b = make_identity(2, "key-b");
+        let key_c = make_identity(3, "key-c");
+        let fp_a = fp(&key_a);
+        let fp_b = fp(&key_b);
+        let cwd = env::current_dir().unwrap();
+
+        let upstream_listener = UnixListener::bind(dir.path("upstream.sock")).unwrap();
+        let proxy_listener = UnixListener::bind(dir.path("proxy.sock")).unwrap();
+
+        tokio::spawn(fake_upstream(upstream_listener, vec![key_a, key_b, key_c]));
+        tokio::spawn(start_proxy(
+            proxy_listener,
+            make_config(&dir, vec![
+                MatchRule {
+                    fingerprint: fp_a.clone(),
+                    directories: vec![cwd.clone()],
+                },
+                MatchRule {
+                    fingerprint: fp_b.clone(),
+                    directories: vec![cwd],
+                },
+            ]),
+        ));
+
+        let mut client = UnixStream::connect(dir.path("proxy.sock")).await.unwrap();
+        let ids = expect_identities(send_request(&mut client, &Request::RequestIdentities).await);
+        assert_eq!(ids.len(), 2);
+        let fps: Vec<_> = ids.iter().filter_map(identity_fingerprint).collect();
+        assert!(fps.contains(&fp_a));
+        assert!(fps.contains(&fp_b));
+    }
+
+    #[tokio::test]
+    async fn fingerprint_shared_across_directories() {
+        let dir = TestDir::new("shared");
+        let key_a = make_identity(1, "key-a");
+        let key_b = make_identity(2, "key-b");
+        let fp_a = fp(&key_a);
+        let cwd = env::current_dir().unwrap();
+
+        let upstream_listener = UnixListener::bind(dir.path("upstream.sock")).unwrap();
+        let proxy_listener = UnixListener::bind(dir.path("proxy.sock")).unwrap();
+
+        tokio::spawn(fake_upstream(upstream_listener, vec![key_a, key_b]));
+        tokio::spawn(start_proxy(
+            proxy_listener,
+            make_config(&dir, vec![MatchRule {
+                fingerprint: fp_a.clone(),
+                directories: vec![cwd, PathBuf::from("/some/other/dir")],
+            }]),
+        ));
+
+        let mut client = UnixStream::connect(dir.path("proxy.sock")).await.unwrap();
+        let ids = expect_identities(send_request(&mut client, &Request::RequestIdentities).await);
+        assert_eq!(ids.len(), 1);
+        assert_eq!(identity_fingerprint(&ids[0]).unwrap(), fp_a);
+    }
+
+    #[tokio::test]
+    async fn passthrough_when_cwd_does_not_match_any_rule() {
+        let dir = TestDir::new("nomatch");
+        let key_a = make_identity(1, "key-a");
+
+        let upstream_listener = UnixListener::bind(dir.path("upstream.sock")).unwrap();
+        let proxy_listener = UnixListener::bind(dir.path("proxy.sock")).unwrap();
+
+        tokio::spawn(fake_upstream(upstream_listener, vec![key_a]));
+        tokio::spawn(start_proxy(
+            proxy_listener,
+            make_config(&dir, vec![MatchRule {
+                fingerprint: "SHA256:doesnotmatter".into(),
+                directories: vec![PathBuf::from("/nonexistent/path")],
+            }]),
+        ));
+
+        let mut client = UnixStream::connect(dir.path("proxy.sock")).await.unwrap();
+        let ids = expect_identities(send_request(&mut client, &Request::RequestIdentities).await);
+        assert_eq!(ids.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn non_identity_request_forwarded() {
+        let dir = TestDir::new("nonident");
+        let upstream_listener = UnixListener::bind(dir.path("upstream.sock")).unwrap();
+        let proxy_listener = UnixListener::bind(dir.path("proxy.sock")).unwrap();
+
+        tokio::spawn(fake_upstream(upstream_listener, vec![]));
+        tokio::spawn(start_proxy(proxy_listener, make_config(&dir, vec![])));
+
+        let mut client = UnixStream::connect(dir.path("proxy.sock")).await.unwrap();
+        let resp = send_request(&mut client, &Request::RemoveAllIdentities).await;
+        assert!(matches!(resp, Response::Failure));
+    }
+
+    #[tokio::test]
+    async fn multiple_requests_on_same_connection() {
+        let dir = TestDir::new("multi");
+        let key_a = make_identity(1, "key-a");
+
+        let upstream_listener = UnixListener::bind(dir.path("upstream.sock")).unwrap();
+        let proxy_listener = UnixListener::bind(dir.path("proxy.sock")).unwrap();
+
+        tokio::spawn(fake_upstream(upstream_listener, vec![key_a]));
+        tokio::spawn(start_proxy(proxy_listener, make_config(&dir, vec![])));
+
+        let mut client = UnixStream::connect(dir.path("proxy.sock")).await.unwrap();
+        for _ in 0..3 {
+            let ids =
+                expect_identities(send_request(&mut client, &Request::RequestIdentities).await);
+            assert_eq!(ids.len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn fingerprint_is_stable() {
+        let id = make_identity(42, "test");
+        let fp1 = fp(&id);
+        let fp2 = fp(&id);
+        assert_eq!(fp1, fp2);
+        assert!(fp1.starts_with("SHA256:"));
+    }
+
+    #[tokio::test]
+    async fn different_keys_have_different_fingerprints() {
+        let id_a = make_identity(1, "a");
+        let id_b = make_identity(2, "b");
+        assert_ne!(fp(&id_a), fp(&id_b));
+    }
+
+    #[test]
+    fn expand_tilde_with_home() {
+        let home = env::var("HOME").unwrap();
+        let expanded = expand_tilde(Path::new("~/foo/bar"));
+        assert_eq!(expanded, PathBuf::from(home).join("foo/bar"));
+    }
+
+    #[test]
+    fn expand_tilde_without_prefix() {
+        let path = Path::new("/absolute/path");
+        assert_eq!(expand_tilde(path), path);
     }
 }
