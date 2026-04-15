@@ -1,13 +1,13 @@
 extern crate alloc;
 
 use alloc::sync::Arc;
-use base64::engine::general_purpose::STANDARD_NO_PAD;
 use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD_NO_PAD;
 use core::error::Error;
 use core::fmt;
 use sha2::{Digest as _, Sha256};
 use ssh_agent_lib::{
-    proto::{Identity, Request, Response},
+    proto::{Identity, Response},
     ssh_encoding::{Decode as _, Encode as _},
 };
 use std::env;
@@ -22,10 +22,15 @@ use tokio::net::unix::UCred;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::signal;
 use tokio::sync::watch;
+use tracing::{debug, error, info, warn};
+use tracing_subscriber::EnvFilter;
+use tracing_subscriber::fmt::writer::MakeWriterExt as _;
 
 mod process;
 
-#[derive(serde::Deserialize, Clone)]
+use process::ProcessInfo;
+
+#[derive(serde::Deserialize, serde::Serialize, Clone, Debug)]
 struct Config {
     socket: PathBuf,
     upstream: PathBuf,
@@ -33,7 +38,7 @@ struct Config {
     rules: Vec<MatchRule>,
 }
 
-#[derive(serde::Deserialize, Clone)]
+#[derive(serde::Deserialize, serde::Serialize, Clone, Debug)]
 struct MatchRule {
     fingerprint: String,
     directories: Vec<PathBuf>,
@@ -51,9 +56,9 @@ impl Config {
             let before = rule.directories.len();
             rule.directories.dedup();
             if rule.directories.len() < before {
-                eprintln!(
-                    "[warn] duplicate directories in rule for {}, duplicates ignored",
-                    rule.fingerprint
+                warn!(
+                    fingerprint = rule.fingerprint,
+                    "ignoring duplicate directories found in rule"
                 );
             }
         }
@@ -61,18 +66,9 @@ impl Config {
     }
 
     fn log(&self) {
-        eprintln!("  upstream: {}", self.upstream.display());
-        for rule in &self.rules {
-            eprintln!(
-                "  {} -> {} dir(s)",
-                rule.fingerprint,
-                rule.directories.len()
-            );
-        }
+        info!(config = ?self, "loaded config");
     }
 }
-
-use process::ProcessInfo;
 
 #[derive(Clone, Copy)]
 struct Pid(Option<u32>);
@@ -89,9 +85,7 @@ impl fmt::Display for Pid {
 fn identity_fingerprint(id: &Identity) -> Option<String> {
     let mut buf = Vec::new();
     id.pubkey.encode(&mut buf).ok()?;
-    let hash = Sha256::digest(&buf);
-    let b64 = STANDARD_NO_PAD.encode(hash);
-    Some(format!("SHA256:{b64}"))
+    Some(pubkey_fingerprint(&buf))
 }
 
 fn expand_tilde(path: &Path) -> PathBuf {
@@ -122,6 +116,12 @@ async fn write_frame(stream: &mut UnixStream, data: &[u8]) -> io::Result<()> {
     stream.flush().await
 }
 
+fn pubkey_fingerprint(pubkey_bytes: &[u8]) -> String {
+    let hash = Sha256::digest(pubkey_bytes);
+    let b64 = STANDARD_NO_PAD.encode(hash);
+    format!("SHA256:{b64}")
+}
+
 fn matching_fingerprints(config: &Config, cwd: &Path) -> Vec<String> {
     config
         .rules
@@ -131,44 +131,9 @@ fn matching_fingerprints(config: &Config, cwd: &Path) -> Vec<String> {
         .collect()
 }
 
-async fn proxy_request(
-    client: &mut UnixStream,
-    upstream: &mut UnixStream,
-    allowed_fps: Option<&[String]>,
-    pid: Pid,
-    raw_request: &[u8],
-) -> io::Result<()> {
-    let request = Request::decode(&mut &*raw_request)
-        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, format!("bad request: {err}")))?;
-
-    eprintln!("[req]  pid={pid} {request:?}");
-
-    write_frame(upstream, raw_request).await?;
-    let raw_response = read_frame(upstream).await?;
-
-    let out = match (&request, allowed_fps) {
-        (&Request::RequestIdentities, Some(fps)) => filter_identities(&raw_response, fps, pid),
-        (&Request::RequestIdentities, None) => {
-            if let Ok(Response::IdentitiesAnswer(ref ids)) = Response::decode(&mut &*raw_response) {
-                eprintln!(
-                    "[resp] pid={pid} IdentitiesAnswer: {} key(s), no filter",
-                    ids.len()
-                );
-            }
-            raw_response
-        }
-        _ => {
-            eprintln!("[resp] pid={pid} forwarded");
-            raw_response
-        }
-    };
-
-    write_frame(client, &out).await
-}
-
 fn filter_identities(raw: &[u8], allowed: &[String], pid: Pid) -> Vec<u8> {
     let Ok(Response::IdentitiesAnswer(ids)) = Response::decode(&mut &*raw) else {
-        eprintln!("[resp] pid={pid} could not decode IdentitiesAnswer, forwarding raw");
+        warn!(%pid, "could not decode IdentitiesAnswer");
         return raw.to_vec();
     };
 
@@ -177,60 +142,58 @@ fn filter_identities(raw: &[u8], allowed: &[String], pid: Pid) -> Vec<u8> {
         .into_iter()
         .filter(|id| {
             let Some(fp) = identity_fingerprint(id) else {
-                eprintln!(
-                    "[filt] pid={pid}   DROP  (encoding failed) ({})",
-                    id.comment
-                );
+                warn!(%pid, comment = id.comment, "ERROR");
                 return false;
             };
             let keep = allowed.iter().any(|a| a == &fp);
-            let verb = if keep { "KEEP" } else { "DROP" };
-            eprintln!("[filt] pid={pid}   {verb}  {fp} ({})", id.comment);
+            if keep {
+                debug!(%pid, %fp, comment = id.comment, "KEEP");
+            } else {
+                debug!(%pid, %fp, comment = id.comment, "DROP");
+            }
             keep
         })
         .collect();
 
-    eprintln!(
-        "[resp] pid={pid} IdentitiesAnswer: {total} upstream -> {} returned",
-        filtered.len()
-    );
+    debug!(%pid, total, returned = filtered.len(), "successfully filtered identities");
 
     let mut buf = Vec::new();
     if Response::IdentitiesAnswer(filtered)
         .encode(&mut buf)
         .is_err()
     {
-        eprintln!("[resp] pid={pid} failed to encode filtered response, forwarding raw");
+        error!(%pid, "failed to encode filtered response");
         return raw.to_vec();
     }
     buf
 }
 
-fn log_connection(pid: Pid, uid: Option<u32>, info: &ProcessInfo, allowed_fps: Option<&[String]>) {
-    eprintln!("[conn] new connection");
-    eprintln!("  pid:     {pid}");
-    eprintln!(
-        "  uid:     {}",
-        uid.map_or_else(|| "-".into(), |u| u.to_string())
-    );
-    eprintln!(
-        "  exe:     {}",
-        info.exe.as_deref().and_then(Path::to_str).unwrap_or("-")
-    );
-    eprintln!("  cmdline: {}", info.cmdline.as_deref().unwrap_or("-"));
-    eprintln!(
-        "  cwd:     {}",
-        info.cwd.as_deref().and_then(Path::to_str).unwrap_or("-")
-    );
-    match allowed_fps {
-        Some(fps) => {
-            eprintln!("  matched: {} fingerprint(s)", fps.len());
-            for fp in fps {
-                eprintln!("    {fp}");
+async fn handle_request(
+    client: &mut UnixStream,
+    upstream: &mut UnixStream,
+    allowed_fps: Option<&[String]>,
+    pid: Pid,
+    raw_request: &[u8],
+) -> io::Result<()> {
+    write_frame(upstream, raw_request).await?;
+    let raw_response = read_frame(upstream).await?;
+    let is_identity_request = raw_request.first().copied() == Some(11);
+    let out = if is_identity_request {
+        debug!(%pid, "filtering identities for response");
+        if let Some(fps) = allowed_fps {
+            filter_identities(&raw_response, fps, pid)
+        } else {
+            if let Ok(Response::IdentitiesAnswer(ref ids)) = Response::decode(&mut &*raw_response) {
+                info!(%pid, keys = ids.len(), "identities passthrough");
             }
+            raw_response
         }
-        None => eprintln!("  matched: (none, passthrough)"),
-    }
+    } else {
+        debug!(%pid, "forwarded raw response");
+        raw_response
+    };
+
+    write_frame(client, &out).await
 }
 
 async fn handle_connection(
@@ -241,12 +204,18 @@ async fn handle_connection(
     let cred = client.peer_cred().ok();
     let pid = Pid(cred.as_ref().and_then(UCred::pid).map(i32::cast_unsigned));
     let uid = cred.as_ref().map(UCred::uid);
-
-    let first_request = read_frame(&mut client).await?;
-
     let info = pid
         .0
         .map_or_else(ProcessInfo::empty, |p| ProcessInfo::lookup(&sys, p));
+
+    info!(
+        %pid,
+        uid = uid.map_or_else(|| "-".into(), |u| u.to_string()),
+        exe = info.exe.as_deref().and_then(Path::to_str).unwrap_or("-"),
+        cmdline = info.cmdline.as_deref().unwrap_or("-"),
+        cwd = info.cwd.as_deref().and_then(Path::to_str).unwrap_or("-"),
+        "connection",
+    );
 
     let matched_fps = info
         .cwd
@@ -258,36 +227,40 @@ async fn handle_connection(
         .filter(|fps| !fps.is_empty())
         .map(Vec::as_slice);
 
-    log_connection(pid, uid, &info, allowed_fps);
-
     let mut upstream = UnixStream::connect(&conn_config.upstream).await?;
 
-    proxy_request(&mut client, &mut upstream, allowed_fps, pid, &first_request).await?;
     loop {
         let raw = read_frame(&mut client).await?;
-        proxy_request(&mut client, &mut upstream, allowed_fps, pid, &raw).await?;
+        handle_request(&mut client, &mut upstream, allowed_fps, pid, &raw).await?;
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    let writer = io::stdout.and(io::stderr.with_max_level(tracing::Level::ERROR));
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .with_writer(writer)
+        .with_ansi(io::IsTerminal::is_terminal(&io::stdout()))
+        .with_target(false)
+        .init();
+
     let raw_config_path = env::args()
         .nth(1)
         .ok_or("usage: op-ssh-agent-proxy <config.toml>")?;
     let config_path = expand_tilde(Path::new(&raw_config_path));
     let initial_config = Config::load(&config_path)?;
 
+    initial_config.log();
     drop(fs::remove_file(&initial_config.socket));
     if let Some(parent) = initial_config.socket.parent() {
         fs::create_dir_all(parent)?;
     }
 
     let listener = UnixListener::bind(&initial_config.socket)?;
-    eprintln!(
-        "op-ssh-agent-proxy listening on {}",
-        initial_config.socket.display()
-    );
-    initial_config.log();
+    info!(socket = %initial_config.socket.display(), "listening for connections");
 
     let sys = Arc::new(Mutex::new(System::new()));
     let (config_tx, config_rx) = watch::channel(Arc::new(initial_config));
@@ -295,18 +268,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let reload_path = config_path.clone();
     tokio::spawn(async move {
         let Ok(mut sig) = signal::unix::signal(signal::unix::SignalKind::user_defined1()) else {
-            eprintln!("[warn] failed to register SIGUSR1 handler, config reload disabled");
+            warn!("failed to register SIGUSR1 handler, config reload disabled");
             return;
         };
         loop {
             sig.recv().await;
             match Config::load(&reload_path) {
                 Ok(new) => {
-                    eprintln!("[reload] config reloaded");
+                    info!("SIGUSR1 config reload");
                     new.log();
                     drop(config_tx.send(Arc::new(new)));
                 }
-                Err(err) => eprintln!("[reload] failed: {err}"),
+                Err(err) => error!(%err, "config reload failed"),
             }
         }
     });
@@ -326,7 +299,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             if let Err(err) = handle_connection(client, conn_config, conn_sys).await
                 && err.kind() != io::ErrorKind::UnexpectedEof
             {
-                eprintln!("connection error: {err}");
+                error!(%err, "connection error");
             }
         });
     }

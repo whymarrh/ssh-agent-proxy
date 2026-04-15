@@ -21,14 +21,12 @@ min_ident_chars = "allow"
 missing_docs_in_private_items = "allow"
 mod_module_files = "allow"
 pattern_type_mismatch = "allow"
-print_stderr = "allow"
 question_mark_used = "allow"
 ref_patterns = "allow"
 self_named_module_files = "allow"
 separated_literal_suffix = "allow"
 single_call_fn = "allow"
 unseparated_literal_suffix = "allow"
-use_debug = "allow"
 
 [[bin]]
 name = "op-ssh-agent-proxy"
@@ -41,6 +39,8 @@ sha2 = "0.11.0"
 ssh-agent-lib = { version = "0.5.2", default-features = false, features = ["codec"] }
 sysinfo = "0.38.4"
 tokio = { version = "1.52.0", features = ["macros", "rt-multi-thread", "net", "io-util", "signal"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter", "json"] }
 toml = "1.1.2"
 
 [dev-dependencies]
