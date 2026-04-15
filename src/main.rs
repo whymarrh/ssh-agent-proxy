@@ -3,9 +3,9 @@ extern crate alloc;
 use alloc::sync::Arc;
 use core::fmt;
 use ssh_agent_lib::{
-    proto::{Identity, Response},
+    proto::Response,
     ssh_encoding::{Decode as _, Encode as _},
-    ssh_key::HashAlg,
+    ssh_key::{Fingerprint, HashAlg},
 };
 use std::env;
 use std::fs;
@@ -106,10 +106,6 @@ impl fmt::Display for Pid {
     }
 }
 
-fn identity_fingerprint(id: &Identity) -> String {
-    id.pubkey.fingerprint(HashAlg::default()).to_string()
-}
-
 fn expand_tilde(path: &Path) -> PathBuf {
     path.to_str()
         .and_then(|s| s.strip_prefix("~/"))
@@ -117,7 +113,7 @@ fn expand_tilde(path: &Path) -> PathBuf {
         .unwrap_or_else(|| path.to_path_buf())
 }
 
-async fn read_frame(stream: &mut UnixStream) -> io::Result<Vec<u8>> {
+async fn read_frame_into(stream: &mut UnixStream, buf: &mut Vec<u8>) -> io::Result<()> {
     let len = stream.read_u32().await? as usize;
     if len > 256 * 1024 {
         return Err(io::Error::new(
@@ -125,9 +121,11 @@ async fn read_frame(stream: &mut UnixStream) -> io::Result<Vec<u8>> {
             "frame exceeds 256 KiB",
         ));
     }
-    let mut buf = vec![0u8; len];
-    stream.read_exact(&mut buf).await?;
-    Ok(buf)
+    buf.clear();
+    buf.reserve(len.saturating_sub(buf.capacity()));
+    buf.resize(len, 0);
+    stream.read_exact(buf).await?;
+    Ok(())
 }
 
 async fn write_frame(stream: &mut UnixStream, data: &[u8]) -> io::Result<()> {
@@ -138,27 +136,46 @@ async fn write_frame(stream: &mut UnixStream, data: &[u8]) -> io::Result<()> {
     stream.flush().await
 }
 
-fn matching_fingerprints(config: &Config, cwd: &Path) -> Vec<String> {
+fn matching_fingerprints<'cfg>(config: &'cfg Config, cwd: &Path) -> Vec<&'cfg str> {
     config
         .rules
         .iter()
         .filter(|rule| rule.directories.iter().any(|d| cwd.starts_with(d)))
-        .map(|rule| rule.fingerprint.clone())
+        .map(|rule| rule.fingerprint.as_str())
         .collect()
 }
 
-fn filter_identities(raw: &[u8], allowed: &[String], pid: Pid) -> Vec<u8> {
+fn parse_fingerprints(fps: &[&str]) -> Vec<Fingerprint> {
+    fps.iter()
+        .filter_map(|s| {
+            s.parse::<Fingerprint>().map_or_else(
+                |_| {
+                    warn!(fingerprint = s, "invalid fingerprint in config, skipping");
+                    None
+                },
+                Some,
+            )
+        })
+        .collect()
+}
+
+fn filter_identities(
+    raw: &[u8],
+    allowed: &[Fingerprint],
+    pid: Pid,
+    encode_buf: &mut Vec<u8>,
+) -> Option<()> {
     let Ok(Response::IdentitiesAnswer(ids)) = Response::decode(&mut &*raw) else {
         warn!(%pid, "could not decode IdentitiesAnswer");
-        return raw.to_vec();
+        return None;
     };
 
     let total = ids.len();
     let filtered: Vec<_> = ids
         .into_iter()
         .filter(|id| {
-            let fp = identity_fingerprint(id);
-            let keep = allowed.iter().any(|a| a == &fp);
+            let fp = id.pubkey.fingerprint(HashAlg::Sha256);
+            let keep = allowed.contains(&fp);
             if keep {
                 debug!(%pid, %fp, comment = id.comment, "KEEP");
             } else {
@@ -170,43 +187,48 @@ fn filter_identities(raw: &[u8], allowed: &[String], pid: Pid) -> Vec<u8> {
 
     debug!(%pid, total, returned = filtered.len(), "successfully filtered identities");
 
-    let mut buf = Vec::new();
+    encode_buf.clear();
     if Response::IdentitiesAnswer(filtered)
-        .encode(&mut buf)
+        .encode(encode_buf)
         .is_err()
     {
         error!(%pid, "failed to encode filtered response");
-        return raw.to_vec();
+        return None;
     }
-    buf
+    Some(())
 }
 
 async fn handle_request(
     client: &mut UnixStream,
     upstream: &mut UnixStream,
-    allowed_fps: Option<&[String]>,
+    allowed: Option<&[Fingerprint]>,
     pid: Pid,
-    raw_request: &[u8],
+    request_buf: &[u8],
+    response_buf: &mut Vec<u8>,
+    encode_buf: &mut Vec<u8>,
 ) -> io::Result<()> {
-    write_frame(upstream, raw_request).await?;
-    let raw_response = read_frame(upstream).await?;
-    let is_identity_request = raw_request.first().copied() == Some(11);
-    let out = if is_identity_request {
-        debug!(%pid, "filtering identities for response");
-        if let Some(fps) = allowed_fps {
-            filter_identities(&raw_response, fps, pid)
-        } else {
-            if let Ok(Response::IdentitiesAnswer(ref ids)) = Response::decode(&mut &*raw_response) {
-                info!(%pid, keys = ids.len(), "identities passthrough");
+    write_frame(upstream, request_buf).await?;
+    read_frame_into(upstream, response_buf).await?;
+
+    let is_identity_request = request_buf.first().copied() == Some(11);
+
+    if is_identity_request {
+        if let Some(fps) = allowed {
+            if filter_identities(response_buf, fps, pid, encode_buf).is_some() {
+                return write_frame(client, encode_buf).await;
             }
-            raw_response
+        } else if let Ok(Response::IdentitiesAnswer(ref ids)) =
+            Response::decode(&mut &**response_buf)
+        {
+            info!(%pid, keys = ids.len(), "identities passthrough");
+        } else {
+            debug!(%pid, "could not decode passthrough response");
         }
     } else {
         debug!(%pid, "forwarded raw response");
-        raw_response
-    };
+    }
 
-    write_frame(client, &out).await
+    write_frame(client, response_buf).await
 }
 
 async fn handle_connection(
@@ -236,16 +258,31 @@ async fn handle_connection(
         .as_ref()
         .map(|cwd_path| matching_fingerprints(&conn_config, cwd_path));
 
-    let allowed_fps: Option<&[String]> = matched_fps
+    let allowed: Option<Vec<Fingerprint>> = matched_fps
         .as_ref()
         .filter(|fps| !fps.is_empty())
-        .map(Vec::as_slice);
+        .map(|fps| parse_fingerprints(fps));
+
+    let allowed_slice: Option<&[Fingerprint]> = allowed.as_deref();
 
     let mut upstream = UnixStream::connect(&conn_config.upstream).await?;
 
+    let mut request_buf = Vec::new();
+    let mut response_buf = Vec::new();
+    let mut encode_buf = Vec::new();
+
     loop {
-        let raw = read_frame(&mut client).await?;
-        handle_request(&mut client, &mut upstream, allowed_fps, pid, &raw).await?;
+        read_frame_into(&mut client, &mut request_buf).await?;
+        handle_request(
+            &mut client,
+            &mut upstream,
+            allowed_slice,
+            pid,
+            &request_buf,
+            &mut response_buf,
+            &mut encode_buf,
+        )
+        .await?;
     }
 }
 
@@ -338,7 +375,7 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ssh_agent_lib::proto::Request;
+    use ssh_agent_lib::proto::{Identity, Request};
     use ssh_agent_lib::ssh_key::public::KeyData;
     use tempfile::TempDir;
 
@@ -395,7 +432,7 @@ mod tests {
     }
 
     fn fp(id: &Identity) -> String {
-        identity_fingerprint(id)
+        id.pubkey.fingerprint(HashAlg::Sha256).to_string()
     }
 
     async fn fake_upstream(listener: UnixListener, identities: Vec<Identity>) {
@@ -405,14 +442,15 @@ mod tests {
             };
             let ids = identities.clone();
             tokio::spawn(async move {
+                let mut buf = Vec::new();
                 loop {
-                    let Ok(frame) = read_frame(&mut conn).await else {
+                    if read_frame_into(&mut conn, &mut buf).await.is_err() {
+                        break;
+                    }
+                    let Ok(req) = Request::decode(&mut &*buf) else {
                         break;
                     };
-                    let Ok(req) = Request::decode(&mut &*frame) else {
-                        break;
-                    };
-                    let mut buf = Vec::new();
+                    buf.clear();
                     let resp = match req {
                         Request::RequestIdentities => Response::IdentitiesAnswer(ids.clone()),
                         _ => Response::Failure,
@@ -445,8 +483,9 @@ mod tests {
         let mut buf = Vec::new();
         req.encode(&mut buf).unwrap();
         write_frame(client, &buf).await.unwrap();
-        let resp_buf = read_frame(client).await.unwrap();
-        Response::decode(&mut &*resp_buf).unwrap()
+        buf.clear();
+        read_frame_into(client, &mut buf).await.unwrap();
+        Response::decode(&mut &*buf).unwrap()
     }
 
     fn expect_identities(resp: Response) -> Vec<Identity> {
@@ -476,7 +515,7 @@ mod tests {
         .await;
         let ids = env.request_identities().await;
         assert_eq!(ids.len(), 1);
-        assert_eq!(identity_fingerprint(&ids[0]), fp_a);
+        assert_eq!(fp(&ids[0]), fp_a);
     }
 
     #[tokio::test]
@@ -502,7 +541,7 @@ mod tests {
         .await;
         let ids = env.request_identities().await;
         assert_eq!(ids.len(), 2);
-        let fps: Vec<_> = ids.iter().map(identity_fingerprint).collect();
+        let fps: Vec<_> = ids.iter().map(fp).collect();
         assert!(fps.contains(&fp_a));
         assert!(fps.contains(&fp_b));
     }
@@ -521,7 +560,7 @@ mod tests {
         .await;
         let ids = env.request_identities().await;
         assert_eq!(ids.len(), 1);
-        assert_eq!(identity_fingerprint(&ids[0]), fp_a);
+        assert_eq!(fp(&ids[0]), fp_a);
     }
 
     #[tokio::test]
