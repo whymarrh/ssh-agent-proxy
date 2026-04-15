@@ -15,8 +15,6 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::exit;
-use std::sync::Mutex;
-use sysinfo::System;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::unix::UCred;
 use tokio::net::{UnixListener, UnixStream};
@@ -28,7 +26,7 @@ use tracing_subscriber::fmt::writer::MakeWriterExt as _;
 
 mod process;
 
-use process::ProcessInfo;
+use process::{ProcessInfo, ProcessServer};
 
 #[derive(serde::Deserialize, serde::Serialize, Clone, Debug)]
 struct Config {
@@ -199,14 +197,15 @@ async fn handle_request(
 async fn handle_connection(
     mut client: UnixStream,
     conn_config: Arc<Config>,
-    sys: Arc<Mutex<System>>,
+    ps: ProcessServer,
 ) -> io::Result<()> {
     let cred = client.peer_cred().ok();
     let pid = Pid(cred.as_ref().and_then(UCred::pid).map(i32::cast_unsigned));
     let uid = cred.as_ref().map(UCred::uid);
-    let info = pid
-        .0
-        .map_or_else(ProcessInfo::empty, |p| ProcessInfo::lookup(&sys, p));
+    let info = match pid.0 {
+        Some(p) => ps.lookup(p).await,
+        None => ProcessInfo::empty(),
+    };
 
     info!(
         %pid,
@@ -262,7 +261,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let listener = UnixListener::bind(&initial_config.socket)?;
     info!(socket = %initial_config.socket.display(), "listening for connections");
 
-    let sys = Arc::new(Mutex::new(System::new()));
+    let server = ProcessServer::spawn();
     let (config_tx, config_rx) = watch::channel(Arc::new(initial_config));
 
     let reload_path = config_path.clone();
@@ -294,9 +293,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     loop {
         let (client, _) = listener.accept().await?;
         let conn_config = Arc::clone(&config_rx.borrow());
-        let conn_sys = Arc::clone(&sys);
+        let conn_server = server.clone();
         tokio::spawn(async move {
-            if let Err(err) = handle_connection(client, conn_config, conn_sys).await
+            if let Err(err) = handle_connection(client, conn_config, conn_server).await
                 && err.kind() != io::ErrorKind::UnexpectedEof
             {
                 error!(%err, "connection error");
@@ -308,6 +307,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ssh_agent_lib::proto::Request;
     use ssh_agent_lib::ssh_key::public::KeyData;
     use tempfile::TempDir;
 
@@ -397,15 +397,15 @@ mod tests {
 
     async fn start_proxy(listener: UnixListener, config: Config) {
         let config = Arc::new(config);
-        let sys = Arc::new(Mutex::new(System::new()));
+        let server = ProcessServer::spawn();
         loop {
             let Ok((client, _)) = listener.accept().await else {
                 break;
             };
             let conn_config = Arc::clone(&config);
-            let conn_sys = Arc::clone(&sys);
+            let conn_server = server.clone();
             tokio::spawn(async move {
-                drop(handle_connection(client, conn_config, conn_sys).await);
+                drop(handle_connection(client, conn_config, conn_server).await);
             });
         }
     }
