@@ -41,7 +41,7 @@ serde = { version = "1", features = ["derive"] }
 sha2 = "0.11"
 ssh-agent-lib = { version = "0.5", default-features = false, features = ["codec"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "signal"] }
-toml = "0.8"
+toml = "1"
 
 [profile.release]
 overflow-checks = true
