@@ -5,7 +5,7 @@ use core::fmt;
 use ssh_agent_lib::{
     proto::Response,
     ssh_encoding::{Decode as _, Encode as _},
-    ssh_key::{Fingerprint, HashAlg},
+    ssh_key::{Error as SshKeyError, Fingerprint, HashAlg},
 };
 use std::env;
 use std::fs;
@@ -39,6 +39,13 @@ enum AppError {
     #[error("failed to parse config: {0}")]
     ConfigParse(#[from] TomlError),
 
+    #[error("invalid fingerprint '{fingerprint}' in config: {source}")]
+    InvalidFingerprint {
+        fingerprint: String,
+        #[source]
+        source: SshKeyError,
+    },
+
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
 }
@@ -55,10 +62,21 @@ struct Config {
     rules: Vec<MatchRule>,
 }
 
-#[derive(serde::Deserialize, Clone, Debug)]
+#[derive(serde::Deserialize, Clone)]
 struct MatchRule {
     fingerprint: String,
     directories: Vec<PathBuf>,
+    #[serde(skip)]
+    parsed_fingerprint: Option<Fingerprint>,
+}
+
+impl fmt::Debug for MatchRule {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MatchRule")
+            .field("fingerprint", &self.fingerprint)
+            .field("directories", &self.directories)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Config {
@@ -75,6 +93,12 @@ impl Config {
         config.socket = expand_tilde(&config.socket);
         config.upstream = expand_tilde(&config.upstream);
         for rule in &mut config.rules {
+            rule.parsed_fingerprint = Some(rule.fingerprint.parse::<Fingerprint>().map_err(|source| {
+                AppError::InvalidFingerprint {
+                    fingerprint: rule.fingerprint.clone(),
+                    source,
+                }
+            })?);
             rule.directories = rule.directories.iter().map(|d| expand_tilde(d)).collect();
             let before = rule.directories.len();
             rule.directories.sort();
@@ -136,26 +160,12 @@ async fn write_frame(stream: &mut UnixStream, data: &[u8]) -> io::Result<()> {
     stream.flush().await
 }
 
-fn matching_fingerprints<'cfg>(config: &'cfg Config, cwd: &Path) -> Vec<&'cfg str> {
+fn matching_fingerprints<'cfg>(config: &'cfg Config, cwd: &Path) -> Vec<&'cfg Fingerprint> {
     config
         .rules
         .iter()
         .filter(|rule| rule.directories.iter().any(|d| cwd.starts_with(d)))
-        .map(|rule| rule.fingerprint.as_str())
-        .collect()
-}
-
-fn parse_fingerprints(fps: &[&str]) -> Vec<Fingerprint> {
-    fps.iter()
-        .filter_map(|s| {
-            s.parse::<Fingerprint>().map_or_else(
-                |_| {
-                    warn!(fingerprint = s, "invalid fingerprint in config, skipping");
-                    None
-                },
-                Some,
-            )
-        })
+        .filter_map(|rule| rule.parsed_fingerprint.as_ref())
         .collect()
 }
 
@@ -261,7 +271,7 @@ async fn handle_connection(
     let allowed: Option<Vec<Fingerprint>> = matched_fps
         .as_ref()
         .filter(|fps| !fps.is_empty())
-        .map(|fps| parse_fingerprints(fps));
+        .map(|fps| fps.iter().copied().copied().collect());
 
     let allowed_slice: Option<&[Fingerprint]> = allowed.as_deref();
 
@@ -495,6 +505,15 @@ mod tests {
         }
     }
 
+    fn make_rule(fingerprint: String, directories: Vec<PathBuf>) -> MatchRule {
+        let parsed_fingerprint = Some(fingerprint.parse().unwrap());
+        MatchRule {
+            fingerprint,
+            directories,
+            parsed_fingerprint,
+        }
+    }
+
     #[tokio::test]
     async fn passthrough_when_no_rules() {
         let env = TestEnv::new(vec![make_identity(1, "a"), make_identity(2, "b")], vec![]).await;
@@ -507,10 +526,10 @@ mod tests {
         let fp_a = fp(&key_a);
         let env = TestEnv::new(
             vec![key_a, make_identity(2, "b")],
-            vec![MatchRule {
-                fingerprint: fp_a.clone(),
-                directories: vec![env::current_dir().unwrap()],
-            }],
+            vec![make_rule(
+                fp_a.clone(),
+                vec![env::current_dir().unwrap()],
+            )],
         )
         .await;
         let ids = env.request_identities().await;
@@ -528,14 +547,14 @@ mod tests {
         let env = TestEnv::new(
             vec![key_a, key_b, make_identity(3, "c")],
             vec![
-                MatchRule {
-                    fingerprint: fp_a.clone(),
-                    directories: vec![cwd.clone()],
-                },
-                MatchRule {
-                    fingerprint: fp_b.clone(),
-                    directories: vec![cwd],
-                },
+                make_rule(
+                    fp_a.clone(),
+                    vec![cwd.clone()],
+                ),
+                make_rule(
+                    fp_b.clone(),
+                    vec![cwd],
+                ),
             ],
         )
         .await;
@@ -552,10 +571,10 @@ mod tests {
         let fp_a = fp(&key_a);
         let env = TestEnv::new(
             vec![key_a, make_identity(2, "b")],
-            vec![MatchRule {
-                fingerprint: fp_a.clone(),
-                directories: vec![env::current_dir().unwrap(), PathBuf::from("/other")],
-            }],
+            vec![make_rule(
+                fp_a.clone(),
+                vec![env::current_dir().unwrap(), PathBuf::from("/other")],
+            )],
         )
         .await;
         let ids = env.request_identities().await;
@@ -567,10 +586,10 @@ mod tests {
     async fn passthrough_when_cwd_does_not_match_any_rule() {
         let env = TestEnv::new(
             vec![make_identity(1, "a")],
-            vec![MatchRule {
-                fingerprint: "SHA256:doesnotmatter".into(),
-                directories: vec![PathBuf::from("/nonexistent/path")],
-            }],
+            vec![make_rule(
+                fp(&make_identity(1, "a")),
+                vec![PathBuf::from("/nonexistent/path")],
+            )],
         )
         .await;
         assert_eq!(env.request_identities().await.len(), 1);
@@ -631,7 +650,7 @@ mod tests {
             upstream = "/tmp/upstream.sock"
 
             [[match]]
-            fingerprint = "SHA256:test"
+            fingerprint = "SHA256:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU"
             directories = ["/a", "/b", "/a"]
         "#;
         let raw: Config = toml::from_str(toml).unwrap();
