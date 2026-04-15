@@ -1,7 +1,7 @@
 [package]
 name = "op-ssh-agent-proxy"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 description = "A SSH agent proxy to filter available identities"
 
 [lints.rust]

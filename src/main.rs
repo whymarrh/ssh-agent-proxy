@@ -323,10 +323,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let conn_config = Arc::clone(&config_rx.borrow());
         let conn_sys = Arc::clone(&sys);
         tokio::spawn(async move {
-            if let Err(err) = handle_connection(client, conn_config, conn_sys).await {
-                if err.kind() != io::ErrorKind::UnexpectedEof {
-                    eprintln!("connection error: {err}");
-                }
+            if let Err(err) = handle_connection(client, conn_config, conn_sys).await
+                && err.kind() != io::ErrorKind::UnexpectedEof
+            {
+                eprintln!("connection error: {err}");
             }
         });
     }
