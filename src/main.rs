@@ -67,12 +67,17 @@ impl Config {
             path: path.to_path_buf(),
             source,
         })?;
-        let mut config: Self = toml::from_str(&contents)?;
+        Self::parse(&contents)
+    }
+
+    fn parse(contents: &str) -> Result<Self, AppError> {
+        let mut config: Self = toml::from_str(contents)?;
         config.socket = expand_tilde(&config.socket);
         config.upstream = expand_tilde(&config.upstream);
         for rule in &mut config.rules {
             rule.directories = rule.directories.iter().map(|d| expand_tilde(d)).collect();
             let before = rule.directories.len();
+            rule.directories.sort();
             rule.directories.dedup();
             if rule.directories.len() < before {
                 warn!(
@@ -578,5 +583,21 @@ mod tests {
     fn expand_tilde_without_prefix() {
         let path = Path::new("/absolute/path");
         assert_eq!(expand_tilde(path), path);
+    }
+
+    #[test]
+    fn config_deduplicates_non_consecutive_directories() {
+        let toml = r#"
+            socket = "/tmp/test.sock"
+            upstream = "/tmp/upstream.sock"
+
+            [[match]]
+            fingerprint = "SHA256:test"
+            directories = ["/a", "/b", "/a"]
+        "#;
+        let raw: Config = toml::from_str(toml).unwrap();
+        let parsed = Config::parse(toml).unwrap();
+        assert_eq!(raw.rules[0].directories.len(), 3);
+        assert_eq!(parsed.rules[0].directories.len(), 2);
     }
 }
