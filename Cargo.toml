@@ -13,7 +13,6 @@ pedantic = { level = "warn", priority = -1 }
 nursery = { level = "warn", priority = -1 }
 restriction = { level = "warn", priority = -1 }
 
-# Allowed — contradictory or deliberately opted out.
 arbitrary_source_item_ordering = "allow"
 as_conversions = "allow"
 blanket_clippy_restriction_lints = "allow"
@@ -46,5 +45,4 @@ toml = "1.1.2"
 [profile.release]
 overflow-checks = true
 
-# Standalone crate -- not part of the parent workspace.
 [workspace]

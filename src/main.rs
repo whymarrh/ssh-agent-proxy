@@ -1,8 +1,3 @@
-//! SSH agent proxy that filters identities based on the requesting process's
-//! working directory. Point `IdentityAgent` in your SSH config at this proxy's
-//! socket, and it will forward requests to an upstream agent (e.g. 1Password)
-//! while only exposing keys that match the caller's CWD.
-
 use alloc::sync::Arc;
 use base64::engine::general_purpose::STANDARD_NO_PAD;
 use base64::Engine as _;
@@ -54,7 +49,6 @@ impl Config {
     }
 }
 
-/// Wrapper around `Option<u32>` that displays as the PID or "-".
 #[derive(Clone, Copy)]
 struct Pid(Option<u32>);
 
@@ -239,8 +233,6 @@ async fn handle_connection(mut client: UnixStream, conn_config: Arc<Config>) -> 
     let pid = Pid(cred.as_ref().and_then(UCred::pid).map(i32::cast_unsigned));
     let uid = cred.as_ref().map(UCred::uid);
 
-    // Read the first request before gathering process info.  The client is
-    // definitely alive and fully initialised once it has written to the socket.
     let first_request = read_frame(&mut client).await?;
 
     let exe = pid.0.and_then(get_process_exe);
@@ -319,7 +311,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let (config_tx, config_rx) = watch::channel(Arc::new(initial_config));
 
-    // Reload config on SIGUSR1.
     let reload_path = config_path.clone();
     tokio::spawn(async move {
         let Ok(mut sig) = signal::unix::signal(signal::unix::SignalKind::user_defined1()) else {
@@ -339,7 +330,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     });
 
-    // Remove socket on ctrl-c.
     let cleanup_path = config_rx.borrow().socket.clone();
     tokio::spawn(async move {
         drop(signal::ctrl_c().await);
