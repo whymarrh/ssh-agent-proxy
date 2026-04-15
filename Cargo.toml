@@ -39,7 +39,7 @@ base64 = "0.22.1"
 serde = { version = "1.0.228", features = ["derive"] }
 sha2 = "0.11.0"
 ssh-agent-lib = { version = "0.5.2", default-features = false, features = ["codec"] }
-tokio = { version = "1.51.1", features = ["macros", "rt-multi-thread", "net", "io-util", "signal"] }
+tokio = { version = "1.52.0", features = ["macros", "rt-multi-thread", "net", "io-util", "signal"] }
 toml = "1.1.2"
 
 [profile.release]
