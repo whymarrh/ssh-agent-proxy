@@ -4,6 +4,13 @@ version = "0.1.0"
 edition = "2021"
 description = "SSH agent proxy that filters keys based on the requesting process's working directory"
 
+[lints.rust]
+warnings = "deny"
+
+[lints.clippy]
+pedantic = "warn"
+nursery = "warn"
+
 [[bin]]
 name = "op-ssh-agent-proxy"
 path = "src/main.rs"
@@ -15,6 +22,9 @@ sha2 = "0.10"
 ssh-agent-lib = { version = "0.5", default-features = false, features = ["codec"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "signal"] }
 toml = "0.8"
+
+[profile.release]
+overflow-checks = true
 
 # Standalone crate -- not part of the parent workspace.
 [workspace]

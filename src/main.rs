@@ -87,7 +87,9 @@ async fn read_frame(stream: &mut UnixStream) -> io::Result<Vec<u8>> {
 }
 
 async fn write_frame(stream: &mut UnixStream, data: &[u8]) -> io::Result<()> {
-    stream.write_u32(data.len() as u32).await?;
+    let len = u32::try_from(data.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "frame exceeds u32"))?;
+    stream.write_u32(len).await?;
     stream.write_all(data).await?;
     stream.flush().await
 }
@@ -213,8 +215,8 @@ fn filter_identities(raw: &[u8], allowed: &[String], pid: Pid) -> Vec<u8> {
 
 async fn handle_connection(mut client: UnixStream, config: Arc<Config>) -> io::Result<()> {
     let cred = client.peer_cred().ok();
-    let pid = Pid(cred.as_ref().and_then(|c| c.pid()).map(|p| p as u32));
-    let uid = cred.as_ref().map(|c| c.uid());
+    let pid = Pid(cred.as_ref().and_then(tokio::net::unix::UCred::pid).map(i32::cast_unsigned));
+    let uid = cred.as_ref().map(tokio::net::unix::UCred::uid);
 
     // Read the first request before gathering process info.  The client is
     // definitely alive and fully initialised once it has written to the socket.
@@ -226,7 +228,7 @@ async fn handle_connection(mut client: UnixStream, config: Arc<Config>) -> io::R
 
     eprintln!("[conn] new connection");
     eprintln!("  pid:     {pid}");
-    eprintln!("  uid:     {}", uid.map_or("-".into(), |u| u.to_string()));
+    eprintln!("  uid:     {}", uid.map_or_else(|| "-".into(), |u| u.to_string()));
     eprintln!("  exe:     {}", exe.as_deref().and_then(Path::to_str).unwrap_or("-"));
     eprintln!("  cmdline: {}", cmdline.as_deref().unwrap_or("-"));
     eprintln!("  cwd:     {}", cwd.as_deref().and_then(Path::to_str).unwrap_or("-"));
