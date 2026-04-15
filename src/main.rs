@@ -12,8 +12,10 @@ use ssh_agent_lib::{
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::watch;
 
 #[derive(serde::Deserialize, Clone)]
 struct Config {
@@ -209,7 +211,7 @@ fn filter_identities(raw: &[u8], allowed: &[String], pid: Pid) -> Vec<u8> {
     buf
 }
 
-async fn handle_connection(mut client: UnixStream, config: &Config) -> io::Result<()> {
+async fn handle_connection(mut client: UnixStream, config: Arc<Config>) -> io::Result<()> {
     let cred = client.peer_cred().ok();
     let pid = Pid(cred.as_ref().and_then(|c| c.pid()).map(|p| p as u32));
     let uid = cred.as_ref().map(|c| c.uid());
@@ -252,12 +254,20 @@ async fn handle_connection(mut client: UnixStream, config: &Config) -> io::Resul
     }
 }
 
+fn log_config(config: &Config) {
+    eprintln!("  upstream: {}", config.upstream.display());
+    for rule in &config.rules {
+        eprintln!("  {} -> {} key(s)", rule.directory.display(), rule.fingerprints.len());
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config_path = std::env::args()
         .nth(1)
         .ok_or("usage: op-ssh-agent-proxy <config.toml>")?;
-    let config = Config::load(&expand_tilde(Path::new(&config_path)))?;
+    let config_path = expand_tilde(Path::new(&config_path));
+    let config = Config::load(&config_path)?;
 
     let _ = std::fs::remove_file(&config.socket);
     if let Some(parent) = config.socket.parent() {
@@ -266,12 +276,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let listener = UnixListener::bind(&config.socket)?;
     eprintln!("op-ssh-agent-proxy listening on {}", config.socket.display());
-    eprintln!("  upstream: {}", config.upstream.display());
-    for rule in &config.rules {
-        eprintln!("  {} -> {} key(s)", rule.directory.display(), rule.fingerprints.len());
-    }
+    log_config(&config);
 
-    let cleanup_path = config.socket.clone();
+    let (config_tx, config_rx) = watch::channel(Arc::new(config));
+
+    // Reload config on SIGUSR1.
+    let reload_path = config_path.clone();
+    tokio::spawn(async move {
+        let mut sig = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
+            .expect("failed to register SIGUSR1 handler");
+        loop {
+            sig.recv().await;
+            match Config::load(&reload_path) {
+                Ok(new) => {
+                    eprintln!("[reload] config reloaded");
+                    log_config(&new);
+                    let _ = config_tx.send(Arc::new(new));
+                }
+                Err(e) => eprintln!("[reload] failed: {e}"),
+            }
+        }
+    });
+
+    // Remove socket on ctrl-c.
+    let cleanup_path = config_rx.borrow().socket.clone();
     tokio::spawn(async move {
         let _ = tokio::signal::ctrl_c().await;
         let _ = std::fs::remove_file(&cleanup_path);
@@ -280,9 +308,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     loop {
         let (client, _) = listener.accept().await?;
-        let config = config.clone();
+        let config = Arc::clone(&config_rx.borrow());
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(client, &config).await {
+            if let Err(e) = handle_connection(client, config).await {
                 if e.kind() != io::ErrorKind::UnexpectedEof {
                     eprintln!("connection error: {e}");
                 }
