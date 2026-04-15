@@ -47,7 +47,7 @@ mod process;
 
 use process::{ProcessInfo, ProcessServer};
 
-#[derive(serde::Deserialize, serde::Serialize, Clone, Debug)]
+#[derive(serde::Deserialize, Clone, Debug)]
 struct Config {
     socket: PathBuf,
     upstream: PathBuf,
@@ -55,7 +55,7 @@ struct Config {
     rules: Vec<MatchRule>,
 }
 
-#[derive(serde::Deserialize, serde::Serialize, Clone, Debug)]
+#[derive(serde::Deserialize, Clone, Debug)]
 struct MatchRule {
     fingerprint: String,
     directories: Vec<PathBuf>,
