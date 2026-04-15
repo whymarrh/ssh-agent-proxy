@@ -6,10 +6,30 @@ description = "A SSH agent proxy to filter available identities"
 
 [lints.rust]
 warnings = "deny"
+unsafe_code = "forbid"
 
 [lints.clippy]
-pedantic = "warn"
-nursery = "warn"
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+restriction = { level = "warn", priority = -1 }
+
+# Allowed — contradictory or deliberately opted out.
+arbitrary_source_item_ordering = "allow"
+as_conversions = "allow"
+blanket_clippy_restriction_lints = "allow"
+implicit_return = "allow"
+min_ident_chars = "allow"
+missing_docs_in_private_items = "allow"
+mod_module_files = "allow"
+pattern_type_mismatch = "allow"
+print_stderr = "allow"
+question_mark_used = "allow"
+ref_patterns = "allow"
+self_named_module_files = "allow"
+separated_literal_suffix = "allow"
+single_call_fn = "allow"
+unseparated_literal_suffix = "allow"
+use_debug = "allow"
 
 [[bin]]
 name = "op-ssh-agent-proxy"
