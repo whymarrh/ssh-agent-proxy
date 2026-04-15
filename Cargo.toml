@@ -34,9 +34,7 @@ name = "op-ssh-agent-proxy"
 path = "src/main.rs"
 
 [dependencies]
-base64 = "0.22.1"
 serde = { version = "1.0.228", features = ["derive"] }
-sha2 = "0.11.0"
 ssh-agent-lib = { version = "0.5.2", default-features = false, features = ["codec"] }
 sysinfo = "0.38.4"
 thiserror = "2.0.18"

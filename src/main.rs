@@ -1,13 +1,11 @@
 extern crate alloc;
 
 use alloc::sync::Arc;
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD_NO_PAD;
 use core::fmt;
-use sha2::{Digest as _, Sha256};
 use ssh_agent_lib::{
     proto::{Identity, Response},
     ssh_encoding::{Decode as _, Encode as _},
+    ssh_key::HashAlg,
 };
 use std::env;
 use std::fs;
@@ -103,10 +101,8 @@ impl fmt::Display for Pid {
     }
 }
 
-fn identity_fingerprint(id: &Identity) -> Option<String> {
-    let mut buf = Vec::new();
-    id.pubkey.encode(&mut buf).ok()?;
-    Some(pubkey_fingerprint(&buf))
+fn identity_fingerprint(id: &Identity) -> String {
+    id.pubkey.fingerprint(HashAlg::default()).to_string()
 }
 
 fn expand_tilde(path: &Path) -> PathBuf {
@@ -137,12 +133,6 @@ async fn write_frame(stream: &mut UnixStream, data: &[u8]) -> io::Result<()> {
     stream.flush().await
 }
 
-fn pubkey_fingerprint(pubkey_bytes: &[u8]) -> String {
-    let hash = Sha256::digest(pubkey_bytes);
-    let b64 = STANDARD_NO_PAD.encode(hash);
-    format!("SHA256:{b64}")
-}
-
 fn matching_fingerprints(config: &Config, cwd: &Path) -> Vec<String> {
     config
         .rules
@@ -162,10 +152,7 @@ fn filter_identities(raw: &[u8], allowed: &[String], pid: Pid) -> Vec<u8> {
     let filtered: Vec<_> = ids
         .into_iter()
         .filter(|id| {
-            let Some(fp) = identity_fingerprint(id) else {
-                warn!(%pid, comment = id.comment, "ERROR");
-                return false;
-            };
+            let fp = identity_fingerprint(id);
             let keep = allowed.iter().any(|a| a == &fp);
             if keep {
                 debug!(%pid, %fp, comment = id.comment, "KEEP");
@@ -403,7 +390,7 @@ mod tests {
     }
 
     fn fp(id: &Identity) -> String {
-        identity_fingerprint(id).unwrap()
+        identity_fingerprint(id)
     }
 
     async fn fake_upstream(listener: UnixListener, identities: Vec<Identity>) {
@@ -484,7 +471,7 @@ mod tests {
         .await;
         let ids = env.request_identities().await;
         assert_eq!(ids.len(), 1);
-        assert_eq!(identity_fingerprint(&ids[0]).unwrap(), fp_a);
+        assert_eq!(identity_fingerprint(&ids[0]), fp_a);
     }
 
     #[tokio::test]
@@ -510,7 +497,7 @@ mod tests {
         .await;
         let ids = env.request_identities().await;
         assert_eq!(ids.len(), 2);
-        let fps: Vec<_> = ids.iter().filter_map(identity_fingerprint).collect();
+        let fps: Vec<_> = ids.iter().map(identity_fingerprint).collect();
         assert!(fps.contains(&fp_a));
         assert!(fps.contains(&fp_b));
     }
@@ -529,7 +516,7 @@ mod tests {
         .await;
         let ids = env.request_identities().await;
         assert_eq!(ids.len(), 1);
-        assert_eq!(identity_fingerprint(&ids[0]).unwrap(), fp_a);
+        assert_eq!(identity_fingerprint(&ids[0]), fp_a);
     }
 
     #[tokio::test]
