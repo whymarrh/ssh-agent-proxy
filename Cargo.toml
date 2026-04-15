@@ -2,7 +2,7 @@
 name = "op-ssh-agent-proxy"
 version = "0.1.0"
 edition = "2021"
-description = "SSH agent proxy that filters keys based on the requesting process's working directory"
+description = "A SSH agent proxy to filter available identities"
 
 [lints.rust]
 warnings = "deny"
