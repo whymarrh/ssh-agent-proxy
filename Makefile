@@ -3,8 +3,7 @@
 build:
 	cargo build --locked
 
-check:
-	cargo check --locked
+check: clippy test
 
 clippy:
 	cargo clippy --locked

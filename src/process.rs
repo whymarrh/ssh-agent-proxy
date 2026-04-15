@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::thread;
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 use tokio::sync::{mpsc, oneshot};
 
@@ -38,7 +39,7 @@ pub struct ProcessServer {
 impl ProcessServer {
     pub fn spawn() -> Self {
         let (tx, mut rx) = mpsc::channel::<ProcessLookupMsg>(100);
-        std::thread::spawn(move || {
+        thread::spawn(move || {
             let mut sys = System::new();
             while let Some(msg) = rx.blocking_recv() {
                 let sysinfo_pid = Pid::from_u32(msg.pid);
@@ -62,7 +63,7 @@ impl ProcessServer {
                             }),
                         }
                     });
-                let _ = msg.reply_to.send(info);
+                drop(msg.reply_to.send(info));
             }
         });
         Self { tx }

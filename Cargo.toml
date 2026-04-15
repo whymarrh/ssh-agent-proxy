@@ -17,6 +17,7 @@ arbitrary_source_item_ordering = "allow"
 as_conversions = "allow"
 blanket_clippy_restriction_lints = "allow"
 implicit_return = "allow"
+integer_division_remainder_used = "allow"
 min_ident_chars = "allow"
 missing_docs_in_private_items = "allow"
 mod_module_files = "allow"
@@ -38,6 +39,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 sha2 = "0.11.0"
 ssh-agent-lib = { version = "0.5.2", default-features = false, features = ["codec"] }
 sysinfo = "0.38.4"
+thiserror = "2.0.18"
 tokio = { version = "1.52.0", features = ["macros", "rt-multi-thread", "net", "io-util", "signal"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "json"] }

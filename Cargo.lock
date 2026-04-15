@@ -605,6 +605,7 @@ dependencies = [
  "ssh-agent-lib",
  "sysinfo",
  "tempfile",
+ "thiserror",
  "tokio",
  "toml",
  "tracing",

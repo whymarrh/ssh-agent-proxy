@@ -3,7 +3,6 @@ extern crate alloc;
 use alloc::sync::Arc;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD_NO_PAD;
-use core::error::Error;
 use core::fmt;
 use sha2::{Digest as _, Sha256};
 use ssh_agent_lib::{
@@ -24,6 +23,28 @@ use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::writer::MakeWriterExt as _;
 
+use thiserror::Error;
+use toml::de::Error as TomlError;
+
+#[derive(Debug, Error)]
+enum AppError {
+    #[error("usage: op-ssh-agent-proxy <config.toml>")]
+    MissingConfigArgument,
+
+    #[error("failed to read config at {path}: {source}")]
+    ConfigRead {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("failed to parse config: {0}")]
+    ConfigParse(#[from] TomlError),
+
+    #[error("I/O error: {0}")]
+    Io(#[from] io::Error),
+}
+
 mod process;
 
 use process::{ProcessInfo, ProcessServer};
@@ -43,9 +64,11 @@ struct MatchRule {
 }
 
 impl Config {
-    fn load(path: &Path) -> Result<Self, Box<dyn Error>> {
-        let contents = fs::read_to_string(path)
-            .map_err(|err| format!("failed to read config at {}: {err}", path.display()))?;
+    fn load(path: &Path) -> Result<Self, AppError> {
+        let contents = fs::read_to_string(path).map_err(|source| AppError::ConfigRead {
+            path: path.to_path_buf(),
+            source,
+        })?;
         let mut config: Self = toml::from_str(&contents)?;
         config.socket = expand_tilde(&config.socket);
         config.upstream = expand_tilde(&config.upstream);
@@ -234,8 +257,7 @@ async fn handle_connection(
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn run() -> Result<(), AppError> {
     let writer = io::stdout.and(io::stderr.with_max_level(tracing::Level::ERROR));
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -246,9 +268,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .with_target(false)
         .init();
 
-    let raw_config_path = env::args()
-        .nth(1)
-        .ok_or("usage: op-ssh-agent-proxy <config.toml>")?;
+    let raw_config_path = env::args().nth(1).ok_or(AppError::MissingConfigArgument)?;
     let config_path = expand_tilde(Path::new(&raw_config_path));
     let initial_config = Config::load(&config_path)?;
 
@@ -284,23 +304,42 @@ async fn main() -> Result<(), Box<dyn Error>> {
     });
 
     let cleanup_path = config_rx.borrow().socket.clone();
-    tokio::spawn(async move {
-        drop(signal::ctrl_c().await);
-        drop(fs::remove_file(&cleanup_path));
-        exit(0);
-    });
+    let mut ctrl_c = std::pin::pin!(signal::ctrl_c());
 
     loop {
-        let (client, _) = listener.accept().await?;
-        let conn_config = Arc::clone(&config_rx.borrow());
-        let conn_server = server.clone();
-        tokio::spawn(async move {
-            if let Err(err) = handle_connection(client, conn_config, conn_server).await
-                && err.kind() != io::ErrorKind::UnexpectedEof
-            {
-                error!(%err, "connection error");
+        tokio::select! {
+            accept_result = listener.accept() => {
+                let (client, _) = accept_result?;
+                let conn_config = Arc::clone(&config_rx.borrow());
+                let conn_server = server.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = handle_connection(client, conn_config, conn_server).await
+                        && err.kind() != io::ErrorKind::UnexpectedEof
+                    {
+                        error!(%err, "connection error");
+                    }
+                });
             }
-        });
+            _ = &mut ctrl_c => {
+                info!("shutting down");
+                break;
+            }
+        }
+    }
+
+    drop(fs::remove_file(&cleanup_path));
+    Ok(())
+}
+
+#[tokio::main]
+#[expect(
+    clippy::print_stderr,
+    reason = "error reporting before tracing is available"
+)]
+async fn main() {
+    if let Err(err) = run().await {
+        eprintln!("{err}");
+        exit(1);
     }
 }
 
