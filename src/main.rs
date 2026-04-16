@@ -146,7 +146,6 @@ async fn read_frame_into(stream: &mut UnixStream, buf: &mut Vec<u8>) -> io::Resu
         ));
     }
     buf.clear();
-    buf.reserve(len.saturating_sub(buf.capacity()));
     buf.resize(len, 0);
     stream.read_exact(buf).await?;
     Ok(())
