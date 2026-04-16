@@ -1,7 +1,7 @@
-.PHONY: build check clippy test clean
+.PHONY: build check clippy test clean install uninstall
 
 build:
-	cargo build --locked
+	cargo build --locked --release
 
 check: clippy test
 
@@ -13,3 +13,9 @@ test:
 
 clean:
 	cargo clean
+
+install: build
+	@scripts/install.sh install
+
+uninstall:
+	@scripts/install.sh uninstall

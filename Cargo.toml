@@ -1,5 +1,5 @@
 [package]
-name = "op-ssh-agent-proxy"
+name = "ssh-agent-proxy"
 version = "0.1.0"
 edition = "2024"
 description = "A SSH agent proxy to filter available identities"
@@ -30,7 +30,7 @@ single_call_fn = "allow"
 unseparated_literal_suffix = "allow"
 
 [[bin]]
-name = "op-ssh-agent-proxy"
+name = "ssh-agent-proxy"
 path = "src/main.rs"
 
 [dependencies]
