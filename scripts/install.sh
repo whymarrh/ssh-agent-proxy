@@ -5,7 +5,9 @@ set -u
 set -o pipefail
 set -x
 
-readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly SCRIPT_DIR
+
 readonly BINARY=${BINARY:-"ssh-agent-proxy"}
 readonly INSTALL_DIR=${INSTALL_DIR:-"${HOME}/.local/bin"}
 readonly LOG_DIR=${LOG_DIR:-"${HOME}/.local/share/${BINARY}"}
