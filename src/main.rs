@@ -26,7 +26,7 @@ use toml::de::Error as TomlError;
 
 #[derive(Debug, Error)]
 enum AppError {
-    #[error("usage: op-ssh-agent-proxy <config.toml>")]
+    #[error("usage: ssh-agent-proxy <config.toml>")]
     MissingConfigArgument,
 
     #[error("failed to read config at {path}: {source}")]
