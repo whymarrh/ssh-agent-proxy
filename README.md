@@ -1,6 +1,6 @@
 # ssh-agent-proxy
 
-An SSH agent proxy that filters identities based on the requesting process's working directory. Point `IdentityAgent` in your SSH config at this proxy's socket and forward requests to an upstream agent (e.g. 1Password) while only exposing keys that match the caller's CWD.
+An SSH agent proxy that filters identities based on the requesting process's working directory. Point `IdentityAgent` in your SSH config at this proxy's socket and forward requests to an upstream agent (e.g. 1Password) while only exposing keys that match the process directory.
 
 ## Quick start
 
